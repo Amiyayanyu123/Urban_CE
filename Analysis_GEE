@@ -1,0 +1,338 @@
+//----------------------------------the non-linear regression between LST and EVI
+//----------------------------------------step1 monthly datasets prepareing
+var urban_buffer = ee.FeatureCollection("projects/ee-urbanstudyinequality/assets/GUB_cities_buffer"),
+    urban_ring = ee.FeatureCollection("projects/ee-urbanstudyinequality/assets/global_citiesbuffer_ring"),
+    urban = ee.FeatureCollection("projects/ee-urbanstudyinequality-1/assets/GUB_Global_2018_100_simply");
+    
+var mask_image_bit = function (imagecol,maskband,bit) {
+
+function mask_(image) {
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << bit);
+  // Get the pixel QA band.
+  var qa = image.select(maskband);
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).lte(1)
+  return image.updateMask(mask);
+}
+
+return imagecol.map(mask_)
+}
+//
+var reproject_mean = function (image){
+var image =  image.reproject({
+    crs: 'EPSG:4326',
+    scale: 1000
+  }) //questions:about the reproject and resample
+return image
+}
+//VI
+var VI = ee.ImageCollection("MODIS/061/MOD13A2") 
+var VI = mask_image_bit(VI,"DetailedQA",0).map(reproject_mean)
+
+var startyear = 2001; 
+var endyear = 2023; 
+
+var startmonth = 1;
+var endmonth= 12;
+
+var startdate = ee.Date.fromYMD(startyear, startmonth, 1);
+var enddate = ee.Date.fromYMD(endyear+1 , endmonth, 1);
+var years = ee.List.sequence(startyear, endyear);
+var months = ee.List.sequence(startmonth,endmonth);
+//
+var VI = ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m) {
+    // var n=m+1;
+     //print(m)
+      var w = VI.filter(ee.Filter.calendarRange(y, y, 'year'))
+                    .filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .median().multiply(0.0001).select(["EVI","NDVI"]);
+     
+      var w = w.addBands(w.select("NDVI").pow(2).tanh().rename("KNDVI") )
+      
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start', ee.Date.fromYMD(y, m, 1).millis());
+    });
+  }).flatten()
+);
+//LST
+var LST = ee.ImageCollection("MODIS/061/MOD11A2")
+var LST_Day = mask_image_bit(LST,"QC_Day",0).map(reproject_mean)
+var LST_Night = mask_image_bit(LST,"QC_Night",0).map(reproject_mean)
+
+var LST_Day = ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m) {
+    // var n=m+1;
+     //print(m)
+      var w = LST_Day.filter(ee.Filter.calendarRange(y, y, 'year'))
+                    .filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .median().multiply(0.02).select(["LST_Day_1km"]);
+     
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start', ee.Date.fromYMD(y, m, 1).millis());
+    });
+  }).flatten()
+);
+
+var LST_Night = ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return months.map(function(m) {
+    // var n=m+1;
+     //print(m)
+      var w = LST_Night.filter(ee.Filter.calendarRange(y, y, 'year'))
+                    .filter(ee.Filter.calendarRange(m, m, 'month'))
+                    .median().multiply(0.02).select(["LST_Night_1km"]);
+     
+      return w.set('year', y)
+              .set('month', m)
+              .set('system:time_start', ee.Date.fromYMD(y, m, 1).millis());
+    });
+  }).flatten()
+);
+//LULC
+var urban_all = ee.ImageCollection("MODIS/061/MCD12Q1").select("LC_Type1");
+var start_year = 2001;  
+var end_year = 2023;  
+var yearList = ee.List.sequence(start_year, end_year);  
+var yearImgList = yearList.map(function(year) {  
+  year = ee.Number(year);  
+  var time = urban_all.filter(ee.Filter.calendarRange(year, year, "year"))
+  var img = time.median().eq(13).rename("IS")
+  var img = img
+  img = img.set("year", year);  
+  img = img.set("system:index", ee.String(year.toInt()))
+            .set('system:time_start', ee.Date.fromYMD(year, 1, 1).millis())
+  return img;  
+});  
+var LULC = ee.ImageCollection.fromImages(yearImgList);
+
+//----------------------------------------step2 join the datasets
+var filtereq = ee.Filter.equals({
+  leftField: 'year',
+  rightField: 'year',
+});
+var join = ee.Join.saveFirst({
+    matchKey: 'match',
+});
+
+var ALL = ee.ImageCollection(join.apply(VI,LULC,filtereq))
+  .map(function(image) {
+    return image.addBands(image.get('match'));
+  });
+
+//--------------------------------------
+
+var filtereq = ee.Filter.equals({
+  leftField: 'system:time_start',
+  rightField: 'system:time_start',
+});
+var join = ee.Join.saveFirst({
+    matchKey: 'match',
+});
+
+var ALL = ee.ImageCollection(join.apply(ALL,LST_Day,filtereq))
+  .map(function(image) {
+    return image.addBands(image.get('match'));
+  });
+
+var ALL1 = ee.ImageCollection(join.apply(ALL,LST_Night,filtereq))
+  .map(function(image) {
+    return image.addBands(image.get('match'));
+  });
+
+print(ALL)
+
+//-----------------------------------step3 the regression in reducer region
+//-------------------------------EVI-LST_day
+
+var i = "_linear"
+
+var ALL = ALL1.map(function(image) {
+     return image.clip(urban)
+   })
+   
+var ALL_list = ALL.toList(ALL.size()); //iterate(combine, stacked_image);
+
+// 创建一个包含 0 到 275 的索引列表
+var indices = ee.List.sequence(0, 275);
+
+// 定义一个函数来处理每个索引 i
+var processedFeaturesList = indices.map(function(i) {
+  i = ee.Number(i); // 确保 i 是一个 ee.Number 对象
+  
+  // 获取第 i 个图像并选择所需的波段
+  var image = ee.Image(ALL_list.get(i)).select(["EVI", "LST_Day_1km"]);
+  
+  // 对城市区域进行区域减少，使用线性拟合
+  var CE_monthly = image.reduceRegions({
+    collection: urban, // 请确保 urban 是一个有效的 FeatureCollection
+    reducer: ee.Reducer.linearFit(),
+    scale: 1000
+  });
+  
+  // 为每个特征添加属性 'i'
+  var CE_monthly_with_i = CE_monthly.map(function(feature) {
+    return feature.set('Time', i);
+  });
+  
+  // 将 CE_monthly_with_i 转换为 List
+  return CE_monthly_with_i.toList(CE_monthly_with_i.size());
+}).flatten(); // 将所有列表扁平化为一个单一的 List
+
+// 将 List 转换为 FeatureCollection
+var processedFeatures = ee.FeatureCollection(processedFeaturesList)
+.select(['.*'],null,false).select(["scale","ORIG_FID","Time"]);
+
+// 导出合并后的特征集合为单一的 CSV 文件
+Export.table.toDrive({
+  collection: processedFeatures,
+  description: 'CE_univariate_EVI_LSTDay'+i,
+  folder: 'CE_univariate_EVI_LSTDay'+i, 
+  fileFormat: 'CSV'
+});
+
+
+//-------------------------------EVI-LST_night
+
+// 创建一个包含 0 到 275 的索引列表
+var indices = ee.List.sequence(0, 275);
+
+// 定义一个函数来处理每个索引 i
+var processedFeaturesList = indices.map(function(i) {
+  i = ee.Number(i); // 确保 i 是一个 ee.Number 对象
+  
+  // 获取第 i 个图像并选择所需的波段
+  var image = ee.Image(ALL_list.get(i)).select(["EVI", "LST_Night_1km"]);
+  
+  // 对城市区域进行区域减少，使用线性拟合
+  var CE_monthly = image.reduceRegions({
+    collection: urban, // 请确保 urban 是一个有效的 FeatureCollection
+    reducer: ee.Reducer.linearFit(),
+    scale: 1000
+  });
+  
+  // 为每个特征添加属性 'i'
+  var CE_monthly_with_i = CE_monthly.map(function(feature) {
+    return feature.set('Time', i);
+  });
+  
+  // 将 CE_monthly_with_i 转换为 List
+  return CE_monthly_with_i.toList(CE_monthly_with_i.size());
+}).flatten(); // 将所有列表扁平化为一个单一的 List
+
+// 将 List 转换为 FeatureCollection
+var processedFeatures = ee.FeatureCollection(processedFeaturesList)
+.select(['.*'],null,false).select(["scale","ORIG_FID","Time"]);
+
+// 导出合并后的特征集合为单一的 CSV 文件
+Export.table.toDrive({
+  collection: processedFeatures,
+  description: 'CE_univariate_EVI_LSTNight'+i,
+  folder: 'CE_univariate_EVI_LSTNight'+i, 
+  fileFormat: 'CSV'
+});
+
+//-----------------------------------------including the urban boundary
+//include  
+var ALL = ALL1.map(function(image) {
+     var m = image.select("IS").eq(1)
+     return image.updateMask(m).clip(urban_buffer)
+   })
+
+var ALL_list = ALL.toList(ALL.size()); //iterate(combine, stacked_image);
+
+// 创建一个包含 0 到 275 的索引列表
+var indices = ee.List.sequence(0, 275);
+
+// 定义一个函数来处理每个索引 i
+var processedFeaturesList = indices.map(function(i) {
+  i = ee.Number(i); // 确保 i 是一个 ee.Number 对象
+  
+  // 获取第 i 个图像并选择所需的波段
+  var image = ee.Image(ALL_list.get(i)).select(["EVI", "LST_Day_1km"]);
+  
+  // 对城市区域进行区域减少，使用线性拟合
+  var CE_monthly = image.reduceRegions({
+    collection: urban_buffer, // 请确保 urban 是一个有效的 FeatureCollection
+    reducer: ee.Reducer.linearFit(),
+    scale: 1000
+  });
+  
+  // 为每个特征添加属性 'i'
+  var CE_monthly_with_i = CE_monthly.map(function(feature) {
+    return feature.set('Time', i);
+  });
+  
+  // 将 CE_monthly_with_i 转换为 List
+  return CE_monthly_with_i.toList(CE_monthly_with_i.size());
+}).flatten(); // 将所有列表扁平化为一个单一的 List
+
+// 将 List 转换为 FeatureCollection
+var processedFeatures = ee.FeatureCollection(processedFeaturesList)
+.select(['.*'],null,false).select(["scale","ORIG_FID","Time"]);
+
+// 导出合并后的特征集合为单一的 CSV 文件
+Export.table.toDrive({
+  collection: processedFeatures,
+  description: 'CE_univariate_EVI_LSTDay_including_expansion'+i,
+  folder: 'CE_univariate_EVI_LSTDay_including_expansion'+i, 
+  fileFormat: 'CSV'
+});
+
+
+//-------------------------------EVI-LST_night
+
+// 创建一个包含 0 到 275 的索引列表
+var indices = ee.List.sequence(0, 275);
+
+// 定义一个函数来处理每个索引 i
+var processedFeaturesList = indices.map(function(i) {
+  i = ee.Number(i); // 确保 i 是一个 ee.Number 对象
+  
+  // 获取第 i 个图像并选择所需的波段
+  var image = ee.Image(ALL_list.get(i)).select(["EVI", "LST_Night_1km"]);
+  
+  // 对城市区域进行区域减少，使用线性拟合
+  var CE_monthly = image.reduceRegions({
+    collection: urban_buffer, // 请确保 urban 是一个有效的 FeatureCollection
+    reducer: ee.Reducer.linearFit(),
+    scale: 1000
+  });
+  
+  // 为每个特征添加属性 'i'
+  var CE_monthly_with_i = CE_monthly.map(function(feature) {
+    return feature.set('Time', i);
+  });
+  
+  // 将 CE_monthly_with_i 转换为 List
+  return CE_monthly_with_i.toList(CE_monthly_with_i.size());
+}).flatten(); // 将所有列表扁平化为一个单一的 List
+
+// 将 List 转换为 FeatureCollection
+var processedFeatures = ee.FeatureCollection(processedFeaturesList)
+.select(['.*'],null,false).select(["scale","ORIG_FID","Time"]);
+
+// 导出合并后的特征集合为单一的 CSV 文件
+Export.table.toDrive({
+  collection: processedFeatures,
+  description: 'CE_univariate_EVI_LSTNight_including_expansion'+i,
+  folder: 'CE_univariate_EVI_LSTNight_including_expansion'+i, 
+  fileFormat: 'CSV'
+});
+
+
+
+
+
+
+
+
+
+
+
+
