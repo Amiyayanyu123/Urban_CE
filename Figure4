@@ -1,0 +1,968 @@
+# 加载必要的包
+library(dplyr)
+library(broom)
+library(lubridate)
+library(tidyr)
+library(purrr)
+library(trend)
+library(Kendall)
+library(imputeTS)
+library(zoo)
+library(randomForest)
+library(glmnet)    # 用于岭回归
+library(scales)    # 用于数据归一化
+library(ggplot2)
+library(caret)     # 用于数据预处理
+library(ggpubr)
+# 定义基于月份的标准化函数
+standardize_monthly <- function(df, predictors, response) {
+  # 计算每个城市每个月的均值和标准差
+  df_standardized <- df %>%
+    group_by(ORIG_FID) %>%
+    mutate(across(all_of(c(predictors, response)), 
+                  list(mean = ~ mean(.x, na.rm = TRUE),
+                       sd = ~ sd(.x, na.rm = TRUE)),
+                  .names = "{.col}_{.fn}")) %>%
+    # 计算Z-scores
+    mutate(across(all_of(c(predictors, response)), 
+                  ~ (.x - get(paste0(cur_column(), "_mean"))) / get(paste0(cur_column(), "_sd")),
+                  .names = "{.col}_z")) %>%
+    ungroup()
+  
+  return(df_standardized)
+}
+
+# 定义用于岭回归的函数
+perform_ridge_regression_day <- function(df, seed = 123) {
+  set.seed(seed)
+  
+  # 提取月份信息
+  df <- df %>%
+    mutate(Time = ymd(Time)) %>%  # 根据您的日期格式调整
+    mutate(Month = month(Time))
+  
+  # 标准化：基于每个城市每个月的Z-scores
+  predictors <- c("Rs", "Temp", "VPD", "pr", "wind", "EVI", "Aldebo")
+  response <- "slope_EVI"
+  
+  df_scaled <- standardize_monthly(df, predictors, response)
+  
+  # 提取标准化后的自变量和因变量
+  predictors_z <- paste0(predictors, "_z")
+  response_z <- paste0(response, "_z")
+  
+  predictors_matrix <- as.matrix(df_scaled[, predictors_z])
+  response_vector <- df_scaled[[response_z]]
+  
+  # 处理可能的NA值（如果有的话）
+  complete_cases <- complete.cases(predictors_matrix, response_vector)
+  predictors_matrix <- predictors_matrix[complete_cases, ]
+  response_vector <- response_vector[complete_cases]
+  
+  # 构建岭回归模型（交叉验证选择最佳lambda）
+  cv_model <- cv.glmnet(predictors_matrix, response_vector, 
+                        alpha = 0, standardize = FALSE,nfolds = 3)
+  best_lambda <- cv_model$lambda.min
+  
+  # 使用最佳lambda构建模型
+  ridge_model <- glmnet(predictors_matrix, response_vector, 
+                        alpha = 0, lambda = best_lambda, standardize = FALSE)
+  
+  # 在整个数据集上进行预测
+  predictions <- predict(ridge_model, newx = predictors_matrix)
+  
+  # 计算R²
+  r2 <- cor(response_vector, predictions)
+  
+  print(r2)
+  # 提取斜率系数并进行归一化
+  coefficients <- as.vector(coef(ridge_model))[-1] # 去掉截距项
+  
+  # 返回结果
+  result <- data.frame(
+    R2 = r2,
+    Rs_coef = coefficients[1],
+    Temp_coef = coefficients[2],
+    VPD_coef = coefficients[3],
+    pr_coef = coefficients[4],
+    wind_coef = coefficients[5],
+    EVI_coef = coefficients[6],
+    Aldebo_coef = coefficients[7]
+  )
+  
+  return(result)
+}
+perform_ridge_regression_night <- function(df, seed = 123) {
+  set.seed(seed)
+  
+  # 提取月份信息
+  df <- df %>%
+    mutate(Time = ymd(Time)) %>%  # 根据您的日期格式调整
+    mutate(Month = month(Time))
+  
+  # 标准化：基于每个城市每个月的Z-scores
+  predictors <- c("Rs", "Temp", "VPD", "pr", "wind", "EVI", "Aldebo")
+  response <- "slope_EVI"
+  
+  df_scaled <- standardize_monthly(df, predictors, response)
+  
+  # 提取标准化后的自变量和因变量
+  predictors_z <- paste0(predictors, "_z")
+  response_z <- paste0(response, "_z")
+  
+  predictors_matrix <- as.matrix(df_scaled[, predictors_z])
+  response_vector <- df_scaled[[response_z]]
+  
+  # 处理可能的NA值（如果有的话）
+  complete_cases <- complete.cases(predictors_matrix, response_vector)
+  predictors_matrix <- predictors_matrix[complete_cases, ]
+  response_vector <- response_vector[complete_cases]
+  
+  # 构建岭回归模型（交叉验证选择最佳lambda）
+  cv_model <- cv.glmnet(predictors_matrix, response_vector, 
+                        alpha = 0, standardize = FALSE,nfolds = 3)
+  best_lambda <- cv_model$lambda.min
+  
+  # 使用最佳lambda构建模型
+  ridge_model <- glmnet(predictors_matrix, response_vector, 
+                        alpha = 0, lambda = best_lambda, standardize = FALSE)
+  
+  # 在整个数据集上进行预测
+  predictions <- predict(ridge_model, newx = predictors_matrix)
+  
+  # 计算R²
+  r2 <- cor(response_vector, predictions)
+  
+  print(r2)
+  # 提取斜率系数并进行归一化
+  coefficients <- as.vector(coef(ridge_model))[-1] # 去掉截距项
+  
+  # 返回结果
+  result <- data.frame(
+    R2 = r2,
+    Rs_coef = coefficients[1],
+    Temp_coef = coefficients[2],
+    VPD_coef = coefficients[3],
+    pr_coef = coefficients[4],
+    wind_coef = coefficients[5],
+    EVI_coef = coefficients[6],
+    Aldebo_coef = coefficients[7]
+  )
+  
+  return(result)
+}
+
+
+# 设置工作目录
+setwd("E:\\Global_urban_vegetation_trees_cooling_effects\\Figure\\Regression")
+
+#----------------------- (1) Day Terra
+data1 <- read.csv("CE_multivar_EVI_LSTDay_including_expansion.csv", header = TRUE, na.strings = "NA") %>%select(ORIG_FID, Time, slope_EVI)
+data2 <- read.csv("UR_Climate_regression_terra.csv", header = TRUE, na.strings = "NA")
+data3 <- read.csv("UR_VI_regression_terra.csv", header = TRUE, na.strings = "NA")
+
+# 合并数据集
+data <- reduce(list(data1, data2, data3),  ~ merge(.x, .y, by = c("ORIG_FID", "Time"))) %>% na.omit(data) %>%
+  mutate(Time = ymd(Time), Month = month(Time))
+
+# 对每个城市进行岭回归分析，并提取结果
+results1 <- data %>% group_by(ORIG_FID) %>% group_split() %>% map_dfr(~ perform_ridge_regression_day(.x)) %>% 
+  transform(ID = "Day",Stal = "Terra")
+
+# -----------------------(2) Night Terra
+data1 <- read.csv("CE_multivar_EVI_LSTNight_including_expansion.csv", header = TRUE, na.strings = "NA") %>%select(ORIG_FID, Time, slope_EVI)
+data2 <- read.csv("UR_Climate_regression_terra.csv", header = TRUE, na.strings = "NA")
+data3 <- read.csv("UR_VI_regression_terra.csv", header = TRUE, na.strings = "NA")
+
+# 合并数据集
+data <- reduce(list(data1, data2, data3),  ~ merge(.x, .y, by = c("ORIG_FID", "Time"))) %>% na.omit(data) %>%
+  mutate(Time = ymd(Time), Month = month(Time))
+
+# 对每个城市进行岭回归分析，并提取结果
+results2 <- data %>% group_by(ORIG_FID) %>% group_split() %>% map_dfr(~ perform_ridge_regression_night(.x)) %>%
+  transform(ID = "Night",Stal = "Terra")
+
+#-----------(3) Aqua Day
+data1 <- read.csv("CE_multivar_EVI_LSTDay_including_expansion_Auqa.csv", header = TRUE, na.strings = "NA") %>%select(ORIG_FID, Time, slope_EVI)
+data2 <- read.csv("UR_Climate_regression_aqua.csv", header = TRUE, na.strings = "NA")
+data3 <- read.csv("UR_VI_regression_aqua.csv", header = TRUE, na.strings = "NA")
+
+# 合并数据集
+data <- reduce(list(data1, data2, data3),  ~ merge(.x, .y, by = c("ORIG_FID", "Time"))) %>% na.omit(data) %>%
+  mutate(Time = ymd(Time), Month = month(Time))
+
+# 对每个城市进行岭回归分析，并提取结果
+results1_ <- data %>% group_by(ORIG_FID) %>% group_split() %>% map_dfr(~ perform_ridge_regression_day(.x)) %>% 
+  transform(ID = "Day",Stal = "Aqua")
+
+#-----------(4) Aqua Night
+data1 <- read.csv("CE_multivar_EVI_LSTNight_including_expansion_Auqa.csv", header = TRUE, na.strings = "NA") %>%select(ORIG_FID, Time, slope_EVI)
+data2 <- read.csv("UR_Climate_regression_aqua.csv", header = TRUE, na.strings = "NA")
+data3 <- read.csv("UR_VI_regression_aqua.csv", header = TRUE, na.strings = "NA")
+
+# 合并数据集
+data <- reduce(list(data1, data2, data3),  ~ merge(.x, .y, by = c("ORIG_FID", "Time"))) %>% na.omit(data) %>%
+  mutate(Time = ymd(Time), Month = month(Time))
+
+# 对每个城市进行岭回归分析，并提取结果
+results2_ <- data %>% group_by(ORIG_FID) %>% group_split() %>% map_dfr(~ perform_ridge_regression_night(.x)) %>% 
+  transform(ID = "Night",Stal = "Aqua")
+
+
+########------------------------plot ridge regression results
+all = rbind(results1,results2,results1_,results2_)
+
+# 转换为长格式数据用于可视化
+results_long <- all %>% pivot_longer(cols = ends_with("_coef"),names_to = "Variable",values_to = "Coefficient") %>%
+  mutate(Variable = gsub("_coef", "", Variable))
+
+plot_a = results_long %>%
+  group_by(ID, Stal, Variable) %>%
+  summarise(
+    n = sum(!is.na(Coefficient)),                             # 有效样本数
+    mean = mean(Coefficient, na.rm = TRUE),                   # 均值
+    sd   = sd(Coefficient, na.rm = TRUE),                     # 标准差
+    se   = sd(Coefficient, na.rm = TRUE) / sqrt(n),           # 标准误
+    .groups = "drop"  # 结束分组，有助于防止后续操作带入分组信息
+  )
+
+A = ggplot(plot_a, aes(x = Variable, y = mean, fill = Stal)) +
+  geom_col(position = position_dodge(0.9))+
+  geom_errorbar(aes(ymin = mean - 2*se, ymax = mean + 2*se), width = 0, size = 1.2, position = position_dodge(0.9)) +
+  labs(x = "Climate Variables",
+       y = "Normalized Coefficient (S.D./S.D.)") +
+  coord_cartesian(ylim = c(-0.2, 0.2)) +
+  theme_bw() + facet_wrap(~ID,scales = "free",ncol = 2)  + scale_fill_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  )+
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+B = ggplot(results_long, aes(x = ID, y = s0, fill = Stal)) +
+  geom_boxplot(outlier.shape =  NA,width = 0.5) +
+  labs(x = " ",
+       y = " ") +
+  theme_bw() +  scale_y_continuous(limits = c(0, 1)) +  scale_fill_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  )+
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+a = ggarrange(A,B,ncol = 2,widths = c(0.7,0.3))
+
+
+###################for annual datasets
+
+perform_ridge_regression_day_annual <- function(df, seed = 123) {
+  set.seed(seed)
+  
+  # --------------------
+  # 1) 将月度数据汇总到年尺度
+  # --------------------
+  # 假设你的 df 中包含以下字段：
+  # ORIG_FID, Year, Rs, Tmin, Tmax, VPD, pr, wind, EVI, Aldebo, LST_Day_1km, swe, slope_EVI
+  # 如果还有别的变量要保留，请相应地加到 summarise(...) 中
+  df_annual <- df %>%
+    group_by(ORIG_FID, Year) %>%
+    summarise(
+      Rs          = mean(Rs, na.rm = TRUE),
+      Temp        = mean(Temp, na.rm = TRUE),
+      VPD         = mean(VPD, na.rm = TRUE),
+      pr          = mean(pr, na.rm = TRUE),
+      wind        = mean(wind, na.rm = TRUE),
+      Aldebo      = mean(Aldebo, na.rm = TRUE),
+      EVI      = mean(EVI, na.rm = TRUE),
+      slope_EVI   = mean(slope_EVI, na.rm = TRUE),
+      .groups     = "drop"  # 取消分组以便后续处理
+    )
+  
+  # --------------------
+  # 2) 定义自变量 & 因变量，并做“年尺度”标准化 (每个城市内做 Z-score)
+  # --------------------
+  # 注意：移除 Temp，新增 Tmin, Tmax, swe
+  predictors <- c("Rs", "Temp", "VPD", "pr", "wind", 
+                  "Aldebo","EVI")
+  response   <- "slope_EVI"
+  
+  df_standardized <- df_annual %>%
+    group_by(ORIG_FID) %>%
+    mutate(
+      across(all_of(c(predictors, response)),
+             list(mean = ~ mean(.x, na.rm = TRUE),
+                  sd   = ~ sd(.x, na.rm = TRUE)),
+             .names = "{.col}_{.fn}"),
+      across(all_of(c(predictors, response)),
+             ~ (.x - get(paste0(cur_column(), "_mean"))) / get(paste0(cur_column(), "_sd")),
+             .names = "{.col}_z")
+    ) %>%
+    ungroup()
+  
+  df_sd_trend = df_standardized %>%
+    summarize(
+      across(ends_with("_z"),
+             ~ coef(lm(.x ~ Year, na.action = na.exclude))[2],
+             .names = "{.col}_trend")
+    )
+  # --------------------
+  # 3) 对每个城市做岭回归，并提取结果
+  # --------------------
+  #    如果该城市年份过少（<3），则返回NA；否则用 cv.glmnet 做交叉验证，获取最佳lambda
+  results <- df_standardized %>%
+    group_by(ORIG_FID) %>%
+    group_modify(~ {
+      data_city <- .x
+      
+      # 3.1 准备自变量矩阵(mat)和因变量(y)，使用“标准化后”的列
+      predictors_z <- paste0(predictors, "_z")  # "Rs_z", "Tmin_z", "Tmax_z", ...
+      response_z   <- paste0(response, "_z")    # "slope_EVI_z"
+      
+      mat <- as.matrix(data_city[, predictors_z])
+      y   <- data_city[[response_z]]
+      
+      # 3.2 过滤缺失值
+      complete_idx <- complete.cases(mat, y)
+      mat <- mat[complete_idx, ]
+      y   <- y[complete_idx]
+      
+      # 若有效数据点 < 3，则无法正常做岭回归，返回 NA
+      if (nrow(mat) < 3) {
+        return(tibble(
+          R2         = NA,
+          Rs_coef    = NA, 
+          Temp_coef  = NA,
+          VPD_coef   = NA, 
+          pr_coef    = NA, 
+          wind_coef  = NA,
+          Aldebo_coef = NA,
+          EVI_coef = NA
+        ))
+      }
+      
+      # 3.3 岭回归 (CV 选择最佳 lambda)
+      cv_model    <- cv.glmnet(mat, y, alpha = 0, standardize = FALSE, nfolds = 3)
+      best_lambda <- cv_model$lambda.min
+      ridge_model <- glmnet(mat, y, alpha = 0, lambda = best_lambda, standardize = FALSE)
+      
+      # 3.4 计算 R^2 (相关系数的平方)
+      preds <- predict(ridge_model, newx = mat)
+      r2    <- cor(y, preds)
+      
+      # 提取岭回归系数 (去掉截距)
+      coefs <- as.vector(coef(ridge_model))[-1]
+      # coefs 的顺序应与 predictors 一一对应
+      
+      tibble(
+        R2          = r2,
+        Rs_coef     = coefs[1],
+        Temp_coef   = coefs[2],
+        VPD_coef    = coefs[3],
+        pr_coef     = coefs[4],
+        wind_coef   = coefs[5],
+        Aldebo_coef = coefs[6],
+        EVI_coef = coefs[7]
+      )
+    }) %>%
+    ungroup()
+  
+  all1 = cbind(results,df_sd_trend) %>%
+    mutate(
+      Rs_effect      = Rs_coef * Rs_z_trend,
+      Temp_effect    = Temp_coef * Temp_z_trend,
+      VPD_effect     = VPD_coef * VPD_z_trend,
+      pr_effect      = pr_coef * pr_z_trend,
+      wind_effect    = wind_coef * wind_z_trend,
+      Aldebo_effect  = Aldebo_coef * Aldebo_z_trend,
+      EVI_effect     = EVI_coef * EVI_z_trend
+    )
+  
+  return(all1)
+}
+
+perform_ridge_regression_night_annual <- function(df, seed = 123) {
+  set.seed(seed)
+  
+  # --------------------
+  # 1) 将月度数据汇总到年尺度
+  # --------------------
+  # 假设你的 df 中包含以下字段：
+  # ORIG_FID, Year, Rs, Tmin, Tmax, VPD, pr, wind, EVI, Aldebo, LST_Day_1km, swe, slope_EVI
+  # 如果还有别的变量要保留，请相应地加到 summarise(...) 中
+  df_annual <- df %>%
+    group_by(ORIG_FID, Year) %>%
+    summarise(
+      Rs          = mean(Rs, na.rm = TRUE),
+      Temp        = mean(Temp, na.rm = TRUE),
+      VPD         = mean(VPD, na.rm = TRUE),
+      pr          = mean(pr, na.rm = TRUE),
+      wind        = mean(wind, na.rm = TRUE),
+      Aldebo      = mean(Aldebo, na.rm = TRUE),
+      EVI      = mean(EVI, na.rm = TRUE),
+      slope_EVI   = mean(slope_EVI, na.rm = TRUE),
+      .groups     = "drop"  # 取消分组以便后续处理
+    )
+  
+  # --------------------
+  # 2) 定义自变量 & 因变量，并做“年尺度”标准化 (每个城市内做 Z-score)
+  # --------------------
+  # 注意：移除 Temp，新增 Tmin, Tmax, swe
+  predictors <- c("Rs", "Temp", "VPD", "pr", "wind", 
+                  "Aldebo","EVI")
+  response   <- "slope_EVI"
+  
+  df_standardized <- df_annual %>%
+    group_by(ORIG_FID) %>%
+    mutate(
+      across(all_of(c(predictors, response)),
+             list(mean = ~ mean(.x, na.rm = TRUE),
+                  sd   = ~ sd(.x, na.rm = TRUE)),
+             .names = "{.col}_{.fn}"),
+      across(all_of(c(predictors, response)),
+             ~ (.x - get(paste0(cur_column(), "_mean"))) / get(paste0(cur_column(), "_sd")),
+             .names = "{.col}_z")
+    ) %>%
+    ungroup()
+  
+  df_sd_trend = df_standardized %>%
+    summarize(
+      across(ends_with("_z"),
+             ~ coef(lm(.x ~ Year, na.action = na.exclude))[2],
+             .names = "{.col}_trend")
+    )
+  # --------------------
+  # 3) 对每个城市做岭回归，并提取结果
+  # --------------------
+  #    如果该城市年份过少（<3），则返回NA；否则用 cv.glmnet 做交叉验证，获取最佳lambda
+  results <- df_standardized %>%
+    group_by(ORIG_FID) %>%
+    group_modify(~ {
+      data_city <- .x
+      
+      # 3.1 准备自变量矩阵(mat)和因变量(y)，使用“标准化后”的列
+      predictors_z <- paste0(predictors, "_z")  # "Rs_z", "Tmin_z", "Tmax_z", ...
+      response_z   <- paste0(response, "_z")    # "slope_EVI_z"
+      
+      mat <- as.matrix(data_city[, predictors_z])
+      y   <- data_city[[response_z]]
+      
+      # 3.2 过滤缺失值
+      complete_idx <- complete.cases(mat, y)
+      mat <- mat[complete_idx, ]
+      y   <- y[complete_idx]
+      
+      # 若有效数据点 < 3，则无法正常做岭回归，返回 NA
+      if (nrow(mat) < 3) {
+        return(tibble(
+          R2         = NA,
+          Rs_coef    = NA, 
+          Temp_coef  = NA,
+          VPD_coef   = NA, 
+          pr_coef    = NA, 
+          wind_coef  = NA,
+          Aldebo_coef = NA,
+          EVI_coef = NA
+        ))
+      }
+      
+      # 3.3 岭回归 (CV 选择最佳 lambda)
+      cv_model    <- cv.glmnet(mat, y, alpha = 0, standardize = FALSE, nfolds = 3)
+      best_lambda <- cv_model$lambda.min
+      ridge_model <- glmnet(mat, y, alpha = 0, lambda = best_lambda, standardize = FALSE)
+      
+      # 3.4 计算 R^2 (相关系数的平方)
+      preds <- predict(ridge_model, newx = mat)
+      r2    <- cor(y, preds)
+      
+      # 提取岭回归系数 (去掉截距)
+      coefs <- as.vector(coef(ridge_model))[-1]
+      # coefs 的顺序应与 predictors 一一对应
+      
+      tibble(
+        R2          = r2,
+        Rs_coef     = coefs[1],
+        Temp_coef   = coefs[2],
+        VPD_coef    = coefs[3],
+        pr_coef     = coefs[4],
+        wind_coef   = coefs[5],
+        Aldebo_coef = coefs[6],
+        EVI_coef = coefs[7]
+      )
+    }) %>%
+    ungroup()
+  
+  all1 = cbind(results,df_sd_trend) %>%
+    mutate(
+      Rs_effect      = Rs_coef * Rs_z_trend,
+      Temp_effect    = Temp_coef * Temp_z_trend,
+      VPD_effect     = VPD_coef * VPD_z_trend,
+      pr_effect      = pr_coef * pr_z_trend,
+      wind_effect    = wind_coef * wind_z_trend,
+      Aldebo_effect  = Aldebo_coef * Aldebo_z_trend,
+      EVI_effect     = EVI_coef * EVI_z_trend
+    )
+  
+  return(all1)
+}
+
+
+setwd("E:\\Global_urban_vegetation_trees_cooling_effects\\Figure\\Regression")
+
+#----------------------- (1) Day Terra
+data1 <- read.csv("CE_multivar_EVI_LSTDay_including_expansion.csv", header = TRUE, na.strings = "NA") %>%select(ORIG_FID, Time, slope_EVI)
+data2 <- read.csv("UR_Climate_regression_terra.csv", header = TRUE, na.strings = "NA")
+data3 <- read.csv("UR_VI_regression_terra.csv", header = TRUE, na.strings = "NA")
+
+# 合并数据集
+data <- reduce(list(data1, data2, data3),  ~ merge(.x, .y, by = c("ORIG_FID", "Time"))) %>% na.omit(data) %>%
+  mutate(
+    date = as.Date("2001-01-01") %m+% months(Time),
+    Year = year(date),
+    month = month(date)
+  )
+
+results1 <- data %>% group_by(ORIG_FID) %>% group_split() %>% map_dfr(~ perform_ridge_regression_day_annual(.x)) %>% 
+  transform(ID = "Day",Stal = "Terra")
+
+# -----------------------(2) Night Terra
+data1 <- read.csv("CE_multivar_EVI_LSTNight_including_expansion.csv", header = TRUE, na.strings = "NA") %>%select(ORIG_FID, Time, slope_EVI)
+data2 <- read.csv("UR_Climate_regression_terra.csv", header = TRUE, na.strings = "NA")
+data3 <- read.csv("UR_VI_regression_terra.csv", header = TRUE, na.strings = "NA")
+
+# 合并数据集
+data <- reduce(list(data1, data2, data3),  ~ merge(.x, .y, by = c("ORIG_FID", "Time"))) %>% na.omit(data) %>%
+  mutate(
+    date = as.Date("2001-01-01") %m+% months(Time),
+    Year = year(date),
+    month = month(date)
+  )
+
+# 对每个城市进行岭回归分析，并提取结果
+results2 <- data %>% group_by(ORIG_FID) %>% group_split() %>% map_dfr(~ perform_ridge_regression_night_annual(.x)) %>%
+  transform(ID = "Night",Stal = "Terra")
+
+#-----------(3) Aqua Day
+data1 <- read.csv("CE_multivar_EVI_LSTDay_including_expansion_Auqa.csv", header = TRUE, na.strings = "NA") %>%select(ORIG_FID, Time, slope_EVI)
+data2 <- read.csv("UR_Climate_regression_aqua.csv", header = TRUE, na.strings = "NA")
+data3 <- read.csv("UR_VI_regression_aqua.csv", header = TRUE, na.strings = "NA")
+
+# 合并数据集
+data <- reduce(list(data1, data2, data3),  ~ merge(.x, .y, by = c("ORIG_FID", "Time"))) %>% na.omit(data) %>%
+  mutate(
+    date = as.Date("2003-01-01") %m+% months(Time),
+    Year = year(date),
+    month = month(date)
+  )
+
+# 对每个城市进行岭回归分析，并提取结果
+results1_ <- data %>% group_by(ORIG_FID) %>% group_split() %>% map_dfr(~ perform_ridge_regression_day_annual(.x)) %>% 
+  transform(ID = "Day",Stal = "Aqua")
+
+#-----------(4) Aqua Night
+data1 <- read.csv("CE_multivar_EVI_LSTNight_including_expansion_Auqa.csv", header = TRUE, na.strings = "NA") %>%select(ORIG_FID, Time, slope_EVI)
+data2 <- read.csv("UR_Climate_regression_aqua.csv", header = TRUE, na.strings = "NA")
+data3 <- read.csv("UR_VI_regression_aqua.csv", header = TRUE, na.strings = "NA")
+
+# 合并数据集
+data <- reduce(list(data1, data2, data3),  ~ merge(.x, .y, by = c("ORIG_FID", "Time"))) %>% na.omit(data) %>%
+  mutate(
+    date = as.Date("2003-01-01") %m+% months(Time),
+    Year = year(date),
+    month = month(date)
+  )
+
+# 对每个城市进行岭回归分析，并提取结果
+results2_ <- data %>% group_by(ORIG_FID) %>% group_split() %>% map_dfr(~ perform_ridge_regression_night_annual(.x)) %>% 
+  transform(ID = "Night",Stal = "Aqua")
+
+
+all = rbind(results1,results2,results1_,results2_)
+
+all_plot1 = all %>% select(contains("effect"),ID,Stal) %>% pivot_longer(cols = ends_with("_effect"),names_to = "Variable",values_to = "Coefficient") %>%
+  mutate(Variable = gsub("_effect", "", Variable)) 
+
+effects_plot = all_plot1 %>%
+  group_by(ID, Stal, Variable) %>%
+  summarise(
+    n = sum(!is.na(Coefficient)),                             # 有效样本数
+    mean = mean(Coefficient, na.rm = TRUE),                   # 均值
+    sd   = sd(Coefficient, na.rm = TRUE),                     # 标准差
+    se   = sd(Coefficient, na.rm = TRUE) / sqrt(n),           # 标准误
+    .groups = "drop"  # 结束分组，有助于防止后续操作带入分组信息
+  )
+#######
+write.csv(results1,"plot_terra_results_annual_day.csv")
+write.csv(results2,"plot_terra_results_annual_night.csv")
+
+
+
+
+
+
+
+
+EF_plot = ggplot(effects_plot, aes(x = Variable, y = mean, fill = Stal)) +
+  geom_col(position = position_dodge(0.9))+
+  geom_errorbar(aes(ymin = mean - 2*se, ymax = mean + 2*se), width = 0, size = 1.2, position = position_dodge(0.9)) +
+  labs(x = "Climate Variables",
+       y = "Normalized Coefficient (S.D./S.D.)") +
+  theme_bw() + facet_wrap(~ID,scales = "free",ncol = 2)  + scale_fill_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  )+
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+
+# 转换为长格式数据用于可视化
+all1 = all %>% select(contains("coef"),ID,Stal)
+
+results_long <- all1 %>% pivot_longer(cols = ends_with("_coef"),names_to = "Variable",values_to = "Coefficient") %>%
+  mutate(Variable = gsub("_coef", "", Variable)) 
+
+plot_a = results_long %>%
+  group_by(ID, Stal, Variable) %>%
+  summarise(
+    n = sum(!is.na(Coefficient)),                             # 有效样本数
+    mean = mean(Coefficient, na.rm = TRUE),                   # 均值
+    sd   = sd(Coefficient, na.rm = TRUE),                     # 标准差
+    se   = sd(Coefficient, na.rm = TRUE) / sqrt(n),           # 标准误
+    .groups = "drop"  # 结束分组，有助于防止后续操作带入分组信息
+  )
+
+A = ggplot(plot_a, aes(x = Variable, y = mean, fill = Stal)) +
+  geom_col(position = position_dodge(0.9))+
+  geom_errorbar(aes(ymin = mean - 2*se, ymax = mean + 2*se), width = 0, size = 1.2, position = position_dodge(0.9)) +
+  labs(x = "Climate Variables",
+       y = "Normalized Coefficient (S.D./S.D.)") +
+  coord_cartesian(ylim = c(-0.1, 0.1)) +
+  theme_bw() + facet_wrap(~ID,scales = "free",ncol = 2)  + scale_fill_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  )+
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+
+B = ggplot(all, aes(x = ID, y = R2, fill = Stal)) +
+  geom_boxplot(outlier.shape =  NA,width = 0.5) +
+  labs(x = " ",
+       y = " ") +
+  theme_bw() +  scale_y_continuous(limits = c(0, 1)) +  scale_fill_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  )+
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+ggarrange(ggarrange(A,EF_plot,nrow = 2),B,ncol = 2,widths = c(0.7,0.3))
+
+b = ggarrange(A,B,ncol = 2,widths = c(0.7,0.3))
+
+ggarrange(a,b,nrow = 2)
+################the annual CE
+
+annual_trend <- function(df, start_date = "2001-01-01") {
+  
+  # Ensure data is sorted by Time
+  df <- df %>% arrange(Year)
+  
+  # Perform interpolation
+  df <- df %>%
+    mutate(
+      slope_EVI_imputed = na.approx(slope_EVI, x = Time, na.rm = FALSE)
+    )
+  
+  # Calculate annual mean slope_EVI
+  annual_mean <- df %>%
+    group_by(Year) %>%
+    summarise(mean_slope_EVI = mean(slope_EVI_imputed, na.rm = TRUE),
+              .groups     = "drop") %>%
+    filter(!is.na(mean_slope_EVI))
+  
+  # Calculate trend over years (Sen's Slope and Mann-Kendall test)
+  if (nrow(annual_mean) >= 3) {
+    # Sen's Slope
+    slope_result_annual <- sens.slope(annual_mean$mean_slope_EVI)
+    
+    # Mann-Kendall Test
+    mk_result_annual <- mk.test(annual_mean$mean_slope_EVI)
+    
+    # Check significance
+    is_significant_annual <- mk_result_annual$p.value < 0.1
+    
+    # Combine trend results into a data frame
+    annual_trend_result <- data.frame(
+      sens_slope = slope_result_annual$estimates,
+      p_value = mk_result_annual$p.value,
+      significant = as.numeric(is_significant_annual)
+    )
+  } else {
+    # Not enough data points for trend analysis
+    annual_trend_result <- data.frame(
+      sens_slope = NA_real_,
+      p_value = NA_real_,
+      significant = NA_real_
+    )
+  }
+  
+  # Combine annual means and trend results into a single data frame
+  overall_result <- data.frame(
+    sens_slope = annual_trend_result$sens_slope,
+    p_value = annual_trend_result$p_value,
+    significant = annual_trend_result$significant
+  )
+  
+  return(overall_result)
+}
+
+data1 <- read.csv("CE_multivar_EVI_LSTDay_including_expansion.csv", header = TRUE, na.strings = "NA") %>% select(ORIG_FID, Time, slope_EVI) %>% 
+  mutate(
+    date = as.Date("2001-01-01") %m+% months(Time),
+    Year = year(date),
+    month = month(date)
+  )
+
+data2 <- read.csv("CE_multivar_EVI_LSTDay_including_expansion_Auqa.csv", header = TRUE, na.strings = "NA") %>% select(ORIG_FID, Time, slope_EVI) %>%
+  mutate(
+    date = as.Date("2003-01-01") %m+% months(Time),
+    Year = year(date),
+    month = month(date)
+  )
+
+data3 <- read.csv("CE_multivar_EVI_LSTNight_including_expansion.csv", header = TRUE, na.strings = "NA") %>% select(ORIG_FID, Time, slope_EVI) %>% 
+  mutate(
+    date = as.Date("2001-01-01") %m+% months(Time),
+    Year = year(date),
+    month = month(date)
+  )
+
+data4 <- read.csv("CE_multivar_EVI_LSTNight_including_expansion_Auqa.csv", header = TRUE, na.strings = "NA") %>% select(ORIG_FID, Time, slope_EVI) %>%
+mutate(
+  date = as.Date("2003-01-01") %m+% months(Time),
+  Year = year(date),
+  month = month(date)
+)
+
+multi1 = data1 %>% group_by(ORIG_FID) %>% do(annual_trend(.)) %>% transform(ID = "Day", stal = "Terra")
+multi2 = data2 %>% group_by(ORIG_FID) %>% do(annual_trend(.)) %>% transform(ID = "Day", stal = "Aqua")
+multi3 = data3 %>% group_by(ORIG_FID) %>% do(annual_trend(.)) %>% transform(ID = "Night", stal = "Terra")
+multi4 = data4 %>% group_by(ORIG_FID) %>% do(annual_trend(.)) %>% transform(ID = "Night", stal = "Aqua")
+
+all = rbind(multi1,multi2,multi3,multi4) 
+
+plot1 <- all %>%
+  group_by(ID, stal) %>%
+  summarise(
+    # 对 sens_slope 进行过滤，剔除 0.02 和 0.98 分位数之外的数据
+    median_slope = median(sens_slope, na.rm = TRUE),
+    Q25_slope = quantile(sens_slope, 0.25, na.rm = TRUE),
+    Q75_slope = quantile(sens_slope, 0.75, na.rm = TRUE),
+    mean_slope = mean(sens_slope[sens_slope >= quantile(sens_slope, 0.02, na.rm = TRUE) & sens_slope <= quantile(sens_slope, 0.98, na.rm = TRUE)], na.rm = TRUE),
+    
+    median_CE = median(mean_slope_EVI, na.rm = TRUE),
+    Q25_CE = quantile(mean_slope_EVI, 0.25, na.rm = TRUE),
+    Q75_CE = quantile(mean_slope_EVI, 0.75, na.rm = TRUE),
+    mean_CE = mean(mean_slope_EVI[mean_slope_EVI >= quantile(mean_slope_EVI, 0.02, na.rm = TRUE) & mean_slope_EVI <= quantile(mean_slope_EVI, 0.98, na.rm = TRUE)], na.rm = TRUE),
+    
+    prop_increase = mean(sens_slope > 0, na.rm = TRUE),
+    prop_decrease = mean(sens_slope < 0, na.rm = TRUE),
+    prop_increase_p = mean(significant == 1 & sens_slope > 0, na.rm = TRUE),
+    prop_decrease_p = mean(significant == 1 & sens_slope < 0, na.rm = TRUE)
+  )
+
+A = ggplot(plot1, aes(x = ID, y = median_slope, color = stal, fill = stal)) +
+  geom_hline(yintercept = 0, linetype = "dashed",size = 1.5, color = "grey") + 
+  geom_errorbar(aes(ymin = Q25_slope, ymax = Q75_slope), width = 0, size = 1.2, position = position_dodge(0.4)) +
+  geom_point(shape = 16, size = 3, position = position_dodge(0.4)) +
+  geom_point(aes(y = mean_slope),shape = 4, size = 3.5, position = position_dodge(0.4)) +
+  theme_bw() +
+  labs(x = " ", y = "Sen's Slope in CE (K/1 per year)") +
+  scale_color_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  )+
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+write.csv(multi1,"Terra_Day_UCE_trend.csv")
+write.csv(multi3,"Terra_Night_UCE_trend.csv")
+
+
+######################Urban Factors
+annual_trend_multiple <- function(df, variables, start_date = "2001-01-01") {
+  
+  # Ensure data is sorted by Time
+  df <- df %>% arrange(Year)
+  
+  # Initialize a list to store results for all variables
+  results_list <- list()
+  
+  # Iterate through each variable
+  for (var in variables) {
+    # Perform interpolation for the current variable
+    df <- df %>%
+      mutate(
+        slope_var_imputed = na.approx(.data[[var]], x = Time, na.rm = FALSE)
+      )
+    
+    # Calculate annual mean for the current variable
+    annual_mean <- df %>%
+      group_by(Year) %>%
+      summarise(mean_slope_var = mean(slope_var_imputed, na.rm = TRUE), .groups = "drop") %>%
+      filter(!is.na(mean_slope_var))
+    
+    # Perform trend analysis
+    if (nrow(annual_mean) >= 3) {
+      # Sen's Slope
+      slope_result_annual <- sens.slope(annual_mean$mean_slope_var)
+      
+      # Mann-Kendall Test
+      mk_result_annual <- mk.test(annual_mean$mean_slope_var)
+      
+      # Check significance
+      is_significant_annual <- mk_result_annual$p.value < 0.1
+      
+      # Combine results into a data frame
+      annual_trend_result <- data.frame(
+        variable = var,
+        sens_slope = slope_result_annual$estimates,
+        p_value = mk_result_annual$p.value,
+        significant = as.numeric(is_significant_annual)
+      )
+    } else {
+      # Not enough data points for trend analysis
+      annual_trend_result <- data.frame(
+        variable = var,
+        sens_slope = NA_real_,
+        p_value = NA_real_,
+        significant = NA_real_
+      )
+    }
+    
+    # Append result to the list
+    results_list[[var]] <- annual_trend_result
+  }
+  
+  # Combine all results into a single data frame
+  overall_results <- do.call(rbind, results_list)
+  
+  return(overall_results)
+}
+
+data2 <- read.csv("UR_Climate_regression_terra.csv", header = TRUE, na.strings = "NA")
+data3 <- read.csv("UR_VI_regression_terra.csv", header = TRUE, na.strings = "NA")
+
+# 合并数据集
+data <- reduce(list(data2, data3),  ~ merge(.x, .y, by = c("ORIG_FID", "Time"))) %>% na.omit(data) %>%
+  mutate( date = as.Date("2001-01-01") %m+% months(Time),Year = year(date),month = month(date))
+
+variables_to_analyze <- c("pr", "VPD", "PDSI", "Temp", "Tmax", "Tmin", "Rs", "Aldebo",
+                          "wind", "swe", "EVI", "LST_Day_1km", "LST_Night_1km")
+
+multi = data %>% group_by(ORIG_FID) %>% do(annual_trend_multiple(.,variables_to_analyze)) 
+
+short_table <- multi %>% na.omit() %>% select(ORIG_FID,variable,sens_slope) %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = c(sens_slope),
+    names_sep = "_"
+  ) %>% select(-swe) %>% na.omit()
+
+write.csv(short_table,"varibales_trend.csv")
+
+
+
+
+
+
+
+
+
+
+
+
