@@ -1,0 +1,1019 @@
+# 加载必要的包
+library(dplyr)
+library(broom)
+library(lubridate)  # 用于日期处理
+library(tidyr)
+library(purrr)
+library(trend)      # 包含 sens.slope 和 mk.test
+library(Kendall)    # 另一个用于 Mann-Kendall 检验的包
+library(imputeTS)
+library(zoo)
+
+sen_trend_annual_season <- function(df, start_date = "2001-01-01") {
+  
+  # Ensure data is sorted by Time
+  df <- df %>% arrange(Time)
+  
+  # Create date, year, month, and season columns
+  df <- df %>%
+    mutate(
+      date = as.Date(start_date) %m+% months(Time),
+      year = year(date),
+      month = month(date),
+      season = case_when(
+        month %in% c(3, 4, 5) ~ "Spring",
+        month %in% c(6, 7, 8) ~ "Summer",
+        month %in% c(9, 10, 11) ~ "Fall",
+        month %in% c(12, 1, 2) ~ "Winter",
+        TRUE ~ NA_character_
+      )
+    )
+  
+  # Perform seasonal interpolation
+  df <- df %>%
+    mutate(
+      slope_EVI_imputed = na.approx(slope_EVI, x = Time, na.rm = FALSE)
+    )
+  
+  # Calculate overall trend
+  df_clean_overall <- df %>% filter(!is.na(slope_EVI_imputed))
+  
+  if(nrow(df_clean_overall) >= 3){
+    # Calculate Sen's Slope
+    slope_result_overall <- sens.slope(df_clean_overall$slope_EVI_imputed)
+    
+    # Perform Mann-Kendall test
+    mk_result_overall <- mk.test(df_clean_overall$slope_EVI_imputed)
+    
+    # Determine if trend is significant (p-value < 0.1)
+    is_significant_overall <- mk_result_overall$p.value < 0.1
+    
+    # Calculate mean slope
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    # Create overall trend result
+    overall_result <- data.frame(
+      season = "All",
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = slope_result_overall$estimates,
+      significant = as.numeric(is_significant_overall)
+    )
+    
+  } else if(nrow(df_clean_overall) == 2){
+    # With two data points, calculate mean but Sen's Slope and significance are not possible
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    overall_result <- data.frame(
+      season = "All",
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = NA_real_,
+      significant = NA
+    )
+    
+  } else {
+    # All slope_EVI are NA or less than 2 data points
+    overall_result <- data.frame(
+      season = "All",
+      mean_slope_EVI = ifelse(nrow(df_clean_overall) == 1, df_clean_overall$slope_EVI_imputed, NA_real_),
+      sens_slope = NA_real_,
+      significant = NA_real_
+    )
+  }
+  
+  # Calculate trends for each season
+  df_clean_season <- df %>% filter(!is.na(slope_EVI_imputed))
+  
+  if(nrow(df_clean_season) >= 3){
+    per_season_result <- df_clean_season %>%
+      group_by(season) %>%
+      do({
+        temp_df <- .
+        if(nrow(temp_df) >= 3){
+          slope_res <- sens.slope(temp_df$slope_EVI_imputed)
+          mk_res <- mk.test(temp_df$slope_EVI_imputed)
+          is_significant <- mk_res$p.value < 0.1
+          mean_slope_EVI <- mean(temp_df$slope_EVI_imputed, na.rm = TRUE)
+          
+          data.frame(
+            season = unique(temp_df$season),
+            mean_slope_EVI = mean_slope_EVI,
+            sens_slope = slope_res$estimates,
+            significant = as.numeric(is_significant)
+          )
+        } else if(nrow(temp_df) == 2){
+          # With two data points
+          mean_slope_EVI <- mean(temp_df$slope_EVI_imputed, na.rm = TRUE)
+          data.frame(
+            season = unique(temp_df$season),
+            mean_slope_EVI = mean_slope_EVI,
+            sens_slope = NA_real_,
+            significant = NA
+          )
+        } else {
+          # Only one data point
+          data.frame(
+            season = unique(temp_df$season),
+            mean_slope_EVI = temp_df$slope_EVI_imputed,
+            sens_slope = NA_real_,
+            significant = NA
+          )
+        }
+      }) %>%
+      ungroup()
+    
+  } else if(nrow(df_clean_season) == 2){
+    # Handle case with exactly two data points across all seasons
+    per_season_result <- df_clean_season %>%
+      group_by(season) %>%
+      summarize(
+        mean_slope_EVI = mean(slope_EVI_imputed, na.rm = TRUE),
+        sens_slope = NA_real_,
+        significant = NA_real_
+      ) %>%
+      ungroup()
+    
+  } else if(nrow(df_clean_season) == 1){
+    # Handle case with exactly one data point
+    per_season_result <- df_clean_season %>%
+      group_by(season) %>%
+      summarize(
+        mean_slope_EVI = slope_EVI_imputed,
+        sens_slope = NA_real_,
+        significant = NA_real_
+      ) %>%
+      ungroup()
+    
+  } else {
+    # All slope_EVI are NA
+    per_season_result <- data.frame(
+      season = character(),
+      mean_slope_EVI = numeric(),
+      sens_slope = numeric(),
+      significant = numeric()
+    )
+  }
+  
+  # Combine overall and seasonal trend results
+  result <- bind_rows(overall_result, per_season_result)
+  
+  return(result)
+} # for the multi-regression, for multivariate
+
+annual_sen1 <- function(df, start_date = "2001-01-01") {
+  
+  # Ensure data is sorted by Time
+  df <- df %>% arrange(Time)
+  
+  # Create date, year, and month columns
+  df <- df %>%
+    mutate(
+      date = as.Date(start_date) %m+% months(Time),
+      year = year(date),
+      month = month(date)
+    )
+  
+  # Perform interpolation
+  df <- df %>%
+    mutate(
+      slope_EVI_imputed = na.approx(scale, x = Time, na.rm = FALSE)
+    )
+  
+  # Calculate overall trend
+  df_clean_overall <- df %>% filter(!is.na(slope_EVI_imputed))
+  
+  if (nrow(df_clean_overall) >= 3) {
+    # Calculate Sen's Slope
+    slope_result_overall <- sens.slope(df_clean_overall$slope_EVI_imputed)
+    
+    # Perform Mann-Kendall test
+    mk_result_overall <- mk.test(df_clean_overall$slope_EVI_imputed)
+    
+    # Determine if trend is significant (p-value < 0.1)
+    is_significant_overall <- mk_result_overall$p.value < 0.1
+    
+    # Calculate mean slope
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    # Create overall trend result
+    overall_result <- data.frame(
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = slope_result_overall$estimates,
+      significant = as.numeric(is_significant_overall)
+    )
+    
+  } else if (nrow(df_clean_overall) == 2) {
+    # With two data points, calculate mean but Sen's Slope and significance are not possible
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    overall_result <- data.frame(
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = NA_real_,
+      significant = NA
+    )
+    
+  } else {
+    # All slope_EVI are NA or less than 2 data points
+    overall_result <- data.frame(
+      mean_slope_EVI = ifelse(nrow(df_clean_overall) == 1, df_clean_overall$slope_EVI_imputed, NA_real_),
+      sens_slope = NA_real_,
+      significant = NA_real_
+    )
+  }
+  
+  # Return the overall result
+  return(overall_result)
+} # for uni
+
+annual_sen2 <- function(df, start_date = "2001-01-01") {
+  
+  # Ensure data is sorted by Time
+  df <- df %>% arrange(Time)
+  
+  # Create date, year, and month columns
+  df <- df %>%
+    mutate(
+      date = as.Date(start_date) %m+% months(Time),
+      year = year(date),
+      month = month(date)
+    )
+  
+  # Perform interpolation
+  df <- df %>%
+    mutate(
+      slope_EVI_imputed = na.approx(slope_EVI, x = Time, na.rm = FALSE)
+    )
+  
+  # Calculate overall trend
+  df_clean_overall <- df %>% filter(!is.na(slope_EVI_imputed))
+  
+  if (nrow(df_clean_overall) >= 3) {
+    # Calculate Sen's Slope
+    slope_result_overall <- sens.slope(df_clean_overall$slope_EVI_imputed)
+    
+    # Perform Mann-Kendall test
+    mk_result_overall <- mk.test(df_clean_overall$slope_EVI_imputed)
+    
+    # Determine if trend is significant (p-value < 0.1)
+    is_significant_overall <- mk_result_overall$p.value < 0.1
+    
+    # Calculate mean slope
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    # Create overall trend result
+    overall_result <- data.frame(
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = slope_result_overall$estimates,
+      significant = as.numeric(is_significant_overall)
+    )
+    
+  } else if (nrow(df_clean_overall) == 2) {
+    # With two data points, calculate mean but Sen's Slope and significance are not possible
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    overall_result <- data.frame(
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = NA_real_,
+      significant = NA
+    )
+    
+  } else {
+    # All slope_EVI are NA or less than 2 data points
+    overall_result <- data.frame(
+      mean_slope_EVI = ifelse(nrow(df_clean_overall) == 1, df_clean_overall$slope_EVI_imputed, NA_real_),
+      sens_slope = NA_real_,
+      significant = NA_real_
+    )
+  }
+  
+  # Return the overall result
+  return(overall_result)
+} # for multi
+
+cal_CE_nonlinear = function(data){
+  data$b = data$scale
+  data$a = exp(data$offset)
+  
+  data$slope_EVI_02 = data$a*data$b*(0.2)^(data$b - 1)
+  data$slope_EVI_03 = data$a*data$b*(0.3)^(data$b - 1)
+  
+  return(data)
+}
+
+annual_sen3 <- function(df, start_date = "2001-01-01") {
+  
+  # Ensure data is sorted by Time
+  df <- df %>% arrange(Time)
+  
+  # Create date, year, and month columns
+  df <- df %>%
+    mutate(
+      date = as.Date(start_date) %m+% months(Time),
+      year = year(date),
+      month = month(date)
+    )
+  
+  # Perform interpolation
+  df <- df %>%
+    mutate(
+      slope_EVI_imputed = na.approx(slope_EVI_03, x = Time, na.rm = FALSE)
+    )
+  
+  # Calculate overall trend
+  df_clean_overall <- df %>% filter(!is.na(slope_EVI_imputed))
+  
+  if (nrow(df_clean_overall) >= 3) {
+    # Calculate Sen's Slope
+    slope_result_overall <- sens.slope(df_clean_overall$slope_EVI_imputed)
+    
+    # Perform Mann-Kendall test
+    mk_result_overall <- mk.test(df_clean_overall$slope_EVI_imputed)
+    
+    # Determine if trend is significant (p-value < 0.1)
+    is_significant_overall <- mk_result_overall$p.value < 0.1
+    
+    # Calculate mean slope
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    # Create overall trend result
+    overall_result <- data.frame(
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = slope_result_overall$estimates,
+      significant = as.numeric(is_significant_overall)
+    )
+    
+  } else if (nrow(df_clean_overall) == 2) {
+    # With two data points, calculate mean but Sen's Slope and significance are not possible
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    overall_result <- data.frame(
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = NA_real_,
+      significant = NA
+    )
+    
+  } else {
+    # All slope_EVI are NA or less than 2 data points
+    overall_result <- data.frame(
+      mean_slope_EVI = ifelse(nrow(df_clean_overall) == 1, df_clean_overall$slope_EVI_imputed, NA_real_),
+      sens_slope = NA_real_,
+      significant = NA_real_
+    )
+  }
+  
+  # Return the overall result
+  return(overall_result)
+} # for non-linear
+
+setwd("E:\\Global_urban_vegetation_trees_cooling_effects\\Urban_CE")
+
+############Terra
+multi_CE_fix1 = read.table("CE_multivar_EVI_LSTDay_2018GUB.csv",header=T, na.strings = "NA", sep=",") 
+multi_CE_fix2 = read.table("CE_multivar_EVI_LSTNight_2018GUB.csv",header=T, na.strings = "NA", sep=",") 
+multi_CE_expan1 = read.table("CE_multivar_EVI_LSTDay_including_expansion.csv",header=T, na.strings = "NA", sep=",") 
+multi_CE_expan2 = read.table("CE_multivar_EVI_LSTNight_including_expansion.csv",header=T, na.strings = "NA", sep=",") 
+
+uni_CE_fix1 = read.table("CE_univariate_EVI_LSTDay_linear.csv",header=T, na.strings = "NA", sep=",") 
+uni_CE_fix2 = read.table("CE_univariate_EVI_LSTNight_linear.csv",header=T, na.strings = "NA", sep=",") 
+uni_CE_expan1 = read.table("CE_univariate_EVI_LSTDay_including_expansion_linear.csv",header=T, na.strings = "NA", sep=",") 
+uni_CE_expan2 = read.table("CE_univariate_EVI_LSTNight_including_expansion_linear.csv",header=T, na.strings = "NA", sep=",") 
+
+multi1 = multi_CE_fix1 %>% group_by(ORIG_FID) %>% do(annual_sen2(.)) %>% transform(ID = "multi_day_noexpan", stal = "Terra")
+multi2 = multi_CE_fix2 %>% group_by(ORIG_FID) %>% do(annual_sen2(.)) %>% transform(ID = "multi_night_noexpan", stal = "Terra")
+multi3 = multi_CE_expan1 %>% group_by(ORIG_FID) %>% do(annual_sen2(.)) %>% transform(ID = "multi_day_expan", stal = "Terra")
+multi4 = multi_CE_expan2 %>% group_by(ORIG_FID) %>% do(annual_sen2(.)) %>% transform(ID = "multi_night_expan", stal = "Terra")
+ 
+uni1 = uni_CE_fix1 %>% group_by(ORIG_FID) %>% do(annual_sen1(.)) %>% transform(ID = "uni_day_noexpan", stal = "Terra")
+uni2 = uni_CE_fix2 %>% group_by(ORIG_FID) %>% do(annual_sen1(.)) %>% transform(ID = "uni_night_noexpan", stal = "Terra")
+uni3 = uni_CE_expan1 %>% group_by(ORIG_FID) %>% do(annual_sen1(.)) %>% transform(ID = "uni_day_expan", stal = "Terra")
+uni4 = uni_CE_expan2 %>% group_by(ORIG_FID) %>% do(annual_sen1(.)) %>% transform(ID = "uni_night_expan", stal = "Terra")
+
+############Terra
+multi_CE_fix1 = read.table("CE_multivar_EVI_LSTDay_2018GUB_Auqa.csv",header=T, na.strings = "NA", sep=",") 
+multi_CE_fix2 = read.table("CE_multivar_EVI_LSTNight_2018GUB_Auqa.csv",header=T, na.strings = "NA", sep=",") 
+multi_CE_expan1 = read.table("CE_multivar_EVI_LSTDay_including_expansion_Auqa.csv",header=T, na.strings = "NA", sep=",") 
+multi_CE_expan2 = read.table("CE_multivar_EVI_LSTNight_including_expansion_Auqa.csv",header=T, na.strings = "NA", sep=",") 
+
+uni_CE_fix1 = read.table("CE_univariate_EVI_LSTDay_linear_Aqua.csv",header=T, na.strings = "NA", sep=",") 
+uni_CE_fix2 = read.table("CE_univariate_EVI_LSTNight_linear_Aqua.csv",header=T, na.strings = "NA", sep=",") 
+uni_CE_expan1 = read.table("CE_univariate_EVI_LSTDay_including_expansion_Aqua.csv",header=T, na.strings = "NA", sep=",") 
+uni_CE_expan2 = read.table("CE_univariate_EVI_LSTNight_including_expansion_Aqua.csv",header=T, na.strings = "NA", sep=",") 
+
+multi1_ = multi_CE_fix1 %>% group_by(ORIG_FID) %>% do(annual_sen2(., start_date = "2003-01-01")) %>% transform(ID = "multi_day_noexpan", stal = "Aqua")
+multi2_ = multi_CE_fix2 %>% group_by(ORIG_FID) %>% do(annual_sen2(., start_date = "2003-01-01")) %>% transform(ID = "multi_night_noexpan", stal = "Aqua")
+multi3_ = multi_CE_expan1 %>% group_by(ORIG_FID) %>% do(annual_sen2(., start_date = "2003-01-01")) %>% transform(ID = "multi_day_expan", stal = "Aqua")
+multi4_ = multi_CE_expan2 %>% group_by(ORIG_FID) %>% do(annual_sen2(., start_date = "2003-01-01")) %>% transform(ID = "multi_night_expan", stal = "Aqua")
+
+uni1_ = uni_CE_fix1 %>% group_by(ORIG_FID) %>% do(annual_sen1(., start_date = "2003-01-01")) %>% transform(ID = "uni_day_noexpan", stal = "Aqua")
+uni2_ = uni_CE_fix2 %>% group_by(ORIG_FID) %>% do(annual_sen1(., start_date = "2003-01-01")) %>% transform(ID = "uni_night_noexpan", stal = "Aqua")
+uni3_ = uni_CE_expan1 %>% group_by(ORIG_FID) %>% do(annual_sen1(., start_date = "2003-01-01")) %>% transform(ID = "uni_day_expan", stal = "Aqua")
+uni4_ = uni_CE_expan2 %>% group_by(ORIG_FID) %>% do(annual_sen1(., start_date = "2003-01-01")) %>% transform(ID = "uni_night_expan", stal = "Aqua")
+
+########################yearly trend of four estimating
+all = rbind(uni1,uni2,uni3,uni4,multi1,multi2,multi3,multi4,
+            uni1_,uni2_,uni3_,uni4_,multi1_,multi2_,multi3_,multi4_)%>%
+  separate(ID, into = c("regre", "time", "consider"), sep = "_") 
+
+plot1 <- all %>%
+  group_by(regre, time, consider, stal) %>%
+  summarise(
+    # 对 sens_slope 进行过滤，剔除 0.02 和 0.98 分位数之外的数据
+    median_slope = median(sens_slope, na.rm = TRUE),
+    Q25_slope = quantile(sens_slope, 0.25, na.rm = TRUE),
+    Q75_slope = quantile(sens_slope, 0.75, na.rm = TRUE),
+    mean_slope = mean(sens_slope[sens_slope >= quantile(sens_slope, 0.02, na.rm = TRUE) & sens_slope <= quantile(sens_slope, 0.98, na.rm = TRUE)], na.rm = TRUE),
+    
+    median_CE = median(mean_slope_EVI, na.rm = TRUE),
+    Q25_CE = quantile(mean_slope_EVI, 0.25, na.rm = TRUE),
+    Q75_CE = quantile(mean_slope_EVI, 0.75, na.rm = TRUE),
+    mean_CE = mean(mean_slope_EVI[mean_slope_EVI >= quantile(mean_slope_EVI, 0.02, na.rm = TRUE) & mean_slope_EVI <= quantile(mean_slope_EVI, 0.98, na.rm = TRUE)], na.rm = TRUE),
+    
+    prop_increase = mean(sens_slope > 0, na.rm = TRUE),
+    prop_decrease = mean(sens_slope < 0, na.rm = TRUE),
+    prop_increase_p = mean(significant == 1 & sens_slope > 0, na.rm = TRUE),
+    prop_decrease_p = mean(significant == 1 & sens_slope < 0, na.rm = TRUE)
+  )
+
+A = ggplot(plot1, aes(x = regre, y = median_slope, color = stal, fill = stal)) +
+  geom_hline(yintercept = 0, linetype = "dashed",size = 1.5, color = "grey") + 
+  geom_errorbar(aes(ymin = Q25_slope, ymax = Q75_slope), width = 0, size = 1.2, position = position_dodge(0.4)) +
+  geom_point(shape = 16, size = 3, position = position_dodge(0.4)) +
+  geom_point(aes(y = mean_slope),shape = 4, size = 3.5, position = position_dodge(0.4)) +
+  theme_bw() +
+  coord_cartesian(ylim = c(-0.01, 0.02)) +
+  labs(x = " ", y = "Sen's Slope in CE (K/1 per month)") +
+  facet_wrap(~time + consider,ncol = 4) +
+  scale_color_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  )+
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+
+B = ggplot(plot1, aes(x = regre, y = median_CE, color = stal, fill = stal)) +
+  geom_hline(yintercept = 0, linetype = "dashed", size = 1.5, color = "grey") + 
+  geom_errorbar(aes(ymin = Q25_CE, ymax = Q75_CE), width = 0, size = 1.2, position = position_dodge(0.4)) +
+  geom_point(shape = 16, size = 3, position = position_dodge(0.4)) +
+  geom_point(aes(y = mean_CE), shape = 4, size = 3.5, position = position_dodge(0.4)) +
+  theme_bw() +
+  labs(x = "Regression Model", y = "CE (K/1)") +
+  facet_wrap(~time + consider, ncol = 4) +
+  scale_color_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  ) +
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+ggarrange(A,B,nrow = 2)
+
+############################export data
+setwd("G:\\Global_urban_vegetation_trees_cooling_effects\\Figure\\Figure1")
+#write.csv(multi3,"multi_day_expan.csv")
+#write.csv(multi4,"multi_night_expan.csv")
+#write.csv(multi1,"multi_day_noexpan.csv")
+#write.csv(multi2,"multi_night_noexpan.csv")
+
+#write.csv(uni1,"uni_day_noexpan.csv")
+#write.csv(uni2,"uni_night_noexpan.csv")
+#write.csv(uni3,"uni_day_expan.csv")
+#write.csv(uni4,"uni_night_expan.csv")
+
+#################pie chart for the multivariate regression of day and night, Terra
+all1 = rbind(multi3,multi4)%>%
+  separate(ID, into = c("regre", "time", "consider"), sep = "_") 
+
+plot2 <- all1 %>%
+  group_by(regre, time, consider, stal) %>%
+  summarise(
+    prop_increase = mean(sens_slope > 0, na.rm = TRUE),
+    prop_decrease = mean(sens_slope < 0, na.rm = TRUE),
+    prop_increase_p = mean(significant == 1 & sens_slope > 0, na.rm = TRUE),
+    prop_decrease_p = mean(significant == 1 & sens_slope < 0, na.rm = TRUE)
+  )
+
+# Create pie charts for day and night
+day_data <- plot2 %>% filter(time == "day")
+night_data <- plot2 %>% filter(time == "night")
+
+# Create day pie chart
+day_df <- data.frame(
+  Category = c("Increase", "Decrease"),
+  Proportion = c(day_data$prop_increase, day_data$prop_decrease)
+)
+
+day_p <- ggplot(day_df, aes(x = "", y = Proportion, fill = Category)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c("Increase" = "#F46D43", "Decrease" = "#74ADD1")) +
+  theme_void() +
+  labs(title = "Pie Chart for Day", subtitle = paste(
+    "++: ", round(day_data$prop_increase_p * 100, 0), "%",
+    "--: ", round(day_data$prop_decrease_p * 100, 0), "%",
+    "+: ", round(day_data$prop_increase * 100, 0), "%",
+    "-: ", round(day_data$prop_decrease * 100, 0), "%"
+  )) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+# Create night pie chart
+night_df <- data.frame(
+  Category = c("Increase", "Decrease"),
+  Proportion = c(night_data$prop_increase, night_data$prop_decrease)
+)
+
+night_p <- ggplot(night_df, aes(x = "", y = Proportion, fill = Category)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c("Increase" = "#F46D43", "Decrease" = "#74ADD1")) +
+  theme_void() +
+  labs(title = "Pie Chart for Night", subtitle = paste(
+    "++: ", round(night_data$prop_increase_p * 100, 0), "%",
+    "--: ", round(night_data$prop_decrease_p * 100, 0), "%",
+    "+: ", round(night_data$prop_increase * 100, 0), "%",
+    "-: ", round(night_data$prop_decrease * 100, 0), "%"
+  )) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+ggarrange(day_p,night_p)
+
+###########################################-----------------------------seasonality and trend
+setwd("G:\\Global_urban_vegetation_trees_cooling_effects\\Urban_CE")
+
+sen_trend_annual_season1 <- function(df, start_date = "2001-01-01") {
+  
+  # Ensure data is sorted by Time
+  df <- df %>% arrange(Time)
+  
+  # Create date, year, month, and season columns
+  df <- df %>%
+    mutate(
+      date = as.Date(start_date) %m+% months(Time),
+      year = year(date),
+      month = month(date),
+      season = case_when(
+        month %in% c(3, 4, 5) ~ "Spring",
+        month %in% c(6, 7, 8) ~ "Summer",
+        month %in% c(9, 10, 11) ~ "Fall",
+        month %in% c(12, 1, 2) ~ "Winter",
+        TRUE ~ NA_character_
+      )
+    )
+  
+  # Perform seasonal interpolation
+  df <- df %>%
+    mutate(
+      slope_EVI_imputed = na.approx(slope_EVI, x = Time, na.rm = FALSE)
+    )
+  
+  # Calculate overall trend
+  df_clean_overall <- df %>% filter(!is.na(slope_EVI_imputed))
+  
+  if(nrow(df_clean_overall) >= 3){
+    # Calculate Sen's Slope
+    slope_result_overall <- sens.slope(df_clean_overall$slope_EVI_imputed)
+    
+    # Perform Mann-Kendall test
+    mk_result_overall <- mk.test(df_clean_overall$slope_EVI_imputed)
+    
+    # Determine if trend is significant (p-value < 0.1)
+    is_significant_overall <- mk_result_overall$p.value < 0.1
+    
+    # Calculate mean slope
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    # Create overall trend result
+    overall_result <- data.frame(
+      season = "All",
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = slope_result_overall$estimates,
+      significant = as.numeric(is_significant_overall)
+    )
+    
+  } else if(nrow(df_clean_overall) == 2){
+    # With two data points, calculate mean but Sen's Slope and significance are not possible
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    overall_result <- data.frame(
+      season = "All",
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = NA_real_,
+      significant = NA
+    )
+    
+  } else {
+    # All slope_EVI are NA or less than 2 data points
+    overall_result <- data.frame(
+      season = "All",
+      mean_slope_EVI = ifelse(nrow(df_clean_overall) == 1, df_clean_overall$slope_EVI_imputed, NA_real_),
+      sens_slope = NA_real_,
+      significant = NA_real_
+    )
+  }
+  
+  # Calculate trends for each season
+  df_clean_season <- df %>% filter(!is.na(slope_EVI_imputed))
+  
+  if(nrow(df_clean_season) >= 3){
+    per_season_result <- df_clean_season %>%
+      group_by(season) %>%
+      do({
+        temp_df <- .
+        if(nrow(temp_df) >= 3){
+          slope_res <- sens.slope(temp_df$slope_EVI_imputed)
+          mk_res <- mk.test(temp_df$slope_EVI_imputed)
+          is_significant <- mk_res$p.value < 0.1
+          mean_slope_EVI <- mean(temp_df$slope_EVI_imputed, na.rm = TRUE)
+          
+          data.frame(
+            season = unique(temp_df$season),
+            mean_slope_EVI = mean_slope_EVI,
+            sens_slope = slope_res$estimates,
+            significant = as.numeric(is_significant)
+          )
+        } else if(nrow(temp_df) == 2){
+          # With two data points
+          mean_slope_EVI <- mean(temp_df$slope_EVI_imputed, na.rm = TRUE)
+          data.frame(
+            season = unique(temp_df$season),
+            mean_slope_EVI = mean_slope_EVI,
+            sens_slope = NA_real_,
+            significant = NA
+          )
+        } else {
+          # Only one data point
+          data.frame(
+            season = unique(temp_df$season),
+            mean_slope_EVI = temp_df$slope_EVI_imputed,
+            sens_slope = NA_real_,
+            significant = NA
+          )
+        }
+      }) %>%
+      ungroup()
+    
+  } else if(nrow(df_clean_season) == 2){
+    # Handle case with exactly two data points across all seasons
+    per_season_result <- df_clean_season %>%
+      group_by(season) %>%
+      summarize(
+        mean_slope_EVI = mean(slope_EVI_imputed, na.rm = TRUE),
+        sens_slope = NA_real_,
+        significant = NA_real_
+      ) %>%
+      ungroup()
+    
+  } else if(nrow(df_clean_season) == 1){
+    # Handle case with exactly one data point
+    per_season_result <- df_clean_season %>%
+      group_by(season) %>%
+      summarize(
+        mean_slope_EVI = slope_EVI_imputed,
+        sens_slope = NA_real_,
+        significant = NA_real_
+      ) %>%
+      ungroup()
+    
+  } else {
+    # All slope_EVI are NA
+    per_season_result <- data.frame(
+      season = character(),
+      mean_slope_EVI = numeric(),
+      sens_slope = numeric(),
+      significant = numeric()
+    )
+  }
+  
+  # Combine overall and seasonal trend results
+  result <- bind_rows(overall_result, per_season_result)
+  
+  return(result)
+} # for the multi-regression, for multivariate
+sen_trend_annual_season2 <- function(df, start_date = "2001-01-01") {
+  
+  # Ensure data is sorted by Time
+  df <- df %>% arrange(Time)
+  
+  # Create date, year, month, and season columns
+  df <- df %>%
+    mutate(
+      date = as.Date(start_date) %m+% months(Time),
+      year = year(date),
+      month = month(date),
+      season = case_when(
+        month %in% c(3, 4, 5) ~ "Spring",
+        month %in% c(6, 7, 8) ~ "Summer",
+        month %in% c(9, 10, 11) ~ "Fall",
+        month %in% c(12, 1, 2) ~ "Winter",
+        TRUE ~ NA_character_
+      )
+    )
+  
+  # Perform seasonal interpolation
+  df <- df %>%
+    mutate(
+      slope_EVI_imputed = na.approx(scale, x = Time, na.rm = FALSE)
+    )
+  
+  # Calculate overall trend
+  df_clean_overall <- df %>% filter(!is.na(slope_EVI_imputed))
+  
+  if(nrow(df_clean_overall) >= 3){
+    # Calculate Sen's Slope
+    slope_result_overall <- sens.slope(df_clean_overall$slope_EVI_imputed)
+    
+    # Perform Mann-Kendall test
+    mk_result_overall <- mk.test(df_clean_overall$slope_EVI_imputed)
+    
+    # Determine if trend is significant (p-value < 0.1)
+    is_significant_overall <- mk_result_overall$p.value < 0.1
+    
+    # Calculate mean slope
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    # Create overall trend result
+    overall_result <- data.frame(
+      season = "All",
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = slope_result_overall$estimates,
+      significant = as.numeric(is_significant_overall)
+    )
+    
+  } else if(nrow(df_clean_overall) == 2){
+    # With two data points, calculate mean but Sen's Slope and significance are not possible
+    mean_slope_EVI_overall <- mean(df_clean_overall$slope_EVI_imputed, na.rm = TRUE)
+    
+    overall_result <- data.frame(
+      season = "All",
+      mean_slope_EVI = mean_slope_EVI_overall,
+      sens_slope = NA_real_,
+      significant = NA
+    )
+    
+  } else {
+    # All slope_EVI are NA or less than 2 data points
+    overall_result <- data.frame(
+      season = "All",
+      mean_slope_EVI = ifelse(nrow(df_clean_overall) == 1, df_clean_overall$slope_EVI_imputed, NA_real_),
+      sens_slope = NA_real_,
+      significant = NA_real_
+    )
+  }
+  
+  # Calculate trends for each season
+  df_clean_season <- df %>% filter(!is.na(slope_EVI_imputed))
+  
+  if(nrow(df_clean_season) >= 3){
+    per_season_result <- df_clean_season %>%
+      group_by(season) %>%
+      do({
+        temp_df <- .
+        if(nrow(temp_df) >= 3){
+          slope_res <- sens.slope(temp_df$slope_EVI_imputed)
+          mk_res <- mk.test(temp_df$slope_EVI_imputed)
+          is_significant <- mk_res$p.value < 0.1
+          mean_slope_EVI <- mean(temp_df$slope_EVI_imputed, na.rm = TRUE)
+          
+          data.frame(
+            season = unique(temp_df$season),
+            mean_slope_EVI = mean_slope_EVI,
+            sens_slope = slope_res$estimates,
+            significant = as.numeric(is_significant)
+          )
+        } else if(nrow(temp_df) == 2){
+          # With two data points
+          mean_slope_EVI <- mean(temp_df$slope_EVI_imputed, na.rm = TRUE)
+          data.frame(
+            season = unique(temp_df$season),
+            mean_slope_EVI = mean_slope_EVI,
+            sens_slope = NA_real_,
+            significant = NA
+          )
+        } else {
+          # Only one data point
+          data.frame(
+            season = unique(temp_df$season),
+            mean_slope_EVI = temp_df$slope_EVI_imputed,
+            sens_slope = NA_real_,
+            significant = NA
+          )
+        }
+      }) %>%
+      ungroup()
+    
+  } else if(nrow(df_clean_season) == 2){
+    # Handle case with exactly two data points across all seasons
+    per_season_result <- df_clean_season %>%
+      group_by(season) %>%
+      summarize(
+        mean_slope_EVI = mean(slope_EVI_imputed, na.rm = TRUE),
+        sens_slope = NA_real_,
+        significant = NA_real_
+      ) %>%
+      ungroup()
+    
+  } else if(nrow(df_clean_season) == 1){
+    # Handle case with exactly one data point
+    per_season_result <- df_clean_season %>%
+      group_by(season) %>%
+      summarize(
+        mean_slope_EVI = slope_EVI_imputed,
+        sens_slope = NA_real_,
+        significant = NA_real_
+      ) %>%
+      ungroup()
+    
+  } else {
+    # All slope_EVI are NA
+    per_season_result <- data.frame(
+      season = character(),
+      mean_slope_EVI = numeric(),
+      sens_slope = numeric(),
+      significant = numeric()
+    )
+  }
+  
+  # Combine overall and seasonal trend results
+  result <- bind_rows(overall_result, per_season_result)
+  
+  return(result)
+} # for the uni-regression, for multivariate
+
+############Terra
+multi_CE_expan1 = read.table("CE_multivar_EVI_LSTDay_including_expansion.csv",header=T, na.strings = "NA", sep=",") 
+multi_CE_expan2 = read.table("CE_multivar_EVI_LSTNight_including_expansion.csv",header=T, na.strings = "NA", sep=",") 
+
+uni_CE_expan1 = read.table("CE_univariate_EVI_LSTDay_including_expansion_linear.csv",header=T, na.strings = "NA", sep=",") 
+uni_CE_expan2 = read.table("CE_univariate_EVI_LSTNight_including_expansion_linear.csv",header=T, na.strings = "NA", sep=",") 
+
+multi3 = multi_CE_expan1 %>% group_by(ORIG_FID) %>% do(sen_trend_annual_season1(.)) %>% transform(ID = "multi_day_expan", stal = "Terra")
+multi4 = multi_CE_expan2 %>% group_by(ORIG_FID) %>% do(sen_trend_annual_season1(.)) %>% transform(ID = "multi_night_expan", stal = "Terra")
+
+uni1 = uni_CE_expan1 %>% group_by(ORIG_FID) %>% do(sen_trend_annual_season2(.)) %>% transform(ID = "uni_day_expan", stal = "Terra")
+uni2 = uni_CE_expan2 %>% group_by(ORIG_FID) %>% do(sen_trend_annual_season2(.)) %>% transform(ID = "uni_night_expan", stal = "Terra")
+
+############Terra
+multi_CE_expan1 = read.table("CE_multivar_EVI_LSTDay_including_expansion_Auqa.csv",header=T, na.strings = "NA", sep=",") 
+multi_CE_expan2 = read.table("CE_multivar_EVI_LSTNight_including_expansion_Auqa.csv",header=T, na.strings = "NA", sep=",") 
+
+multi3_ = multi_CE_expan1 %>% group_by(ORIG_FID) %>% do(sen_trend_annual_season1(., start_date = "2003-01-01")) %>% transform(ID = "multi_day_expan", stal = "Aqua")
+multi4_ = multi_CE_expan2 %>% group_by(ORIG_FID) %>% do(sen_trend_annual_season1(., start_date = "2003-01-01")) %>% transform(ID = "multi_night_expan", stal = "Aqua")
+
+all3 = rbind(multi3,multi4,multi3_,multi4_)%>%
+  separate(ID, into = c("regre", "time", "consider"), sep = "_") 
+
+plot3 <- all3 %>%
+  filter(season %in% c("Spring", "Summer", "Fall", "Winter")) %>%
+  filter(regre == "multi" & consider == "expan") %>%
+  group_by(regre, time, consider, stal, season) %>%
+  summarise(
+    # 对 sens_slope 进行过滤，剔除 0.02 和 0.98 分位数之外的数据
+    median_slope = median(sens_slope, na.rm = TRUE),
+    Q25_slope = quantile(sens_slope, 0.25, na.rm = TRUE),
+    Q75_slope = quantile(sens_slope, 0.75, na.rm = TRUE),
+    mean_slope = mean(sens_slope[sens_slope >= quantile(sens_slope, 0.02, na.rm = TRUE) & sens_slope <= quantile(sens_slope, 0.98, na.rm = TRUE)], na.rm = TRUE),
+    se_slope = sd(sens_slope[sens_slope >= quantile(sens_slope, 0.02, na.rm = TRUE) & sens_slope <= quantile(sens_slope, 0.98, na.rm = TRUE)], na.rm = TRUE) / sqrt(sum(!is.na(sens_slope))),
+    
+    median_CE = median(mean_slope_EVI, na.rm = TRUE),
+    Q25_CE = quantile(mean_slope_EVI, 0.25, na.rm = TRUE),
+    Q75_CE = quantile(mean_slope_EVI, 0.75, na.rm = TRUE),
+    mean_CE = mean(mean_slope_EVI[mean_slope_EVI >= quantile(mean_slope_EVI, 0.02, na.rm = TRUE) & mean_slope_EVI <= quantile(mean_slope_EVI, 0.98, na.rm = TRUE)], na.rm = TRUE),
+    se_CE = sd(mean_slope_EVI[mean_slope_EVI >= quantile(mean_slope_EVI, 0.02, na.rm = TRUE) & mean_slope_EVI <= quantile(mean_slope_EVI, 0.98, na.rm = TRUE)], na.rm = TRUE) / sqrt(sum(!is.na(mean_slope_EVI))),
+    
+    prop_increase = mean(sens_slope > 0, na.rm = TRUE),
+    prop_decrease = mean(sens_slope < 0, na.rm = TRUE),
+    prop_increase_p = mean(significant == 1 & sens_slope > 0, na.rm = TRUE),
+    prop_decrease_p = mean(significant == 1 & sens_slope < 0, na.rm = TRUE)
+  ) %>%
+  arrange(factor(season, levels = c("Spring", "Summer", "Fall", "Winter")))
+
+C = ggplot(plot3, aes(x = season, y = median_slope, color = stal, fill = stal)) +
+  geom_hline(yintercept = 0, linetype = "dashed",size = 1.5, color = "grey") + 
+  geom_point( size = 3, position = position_dodge(0.4)) +
+  theme_bw() +
+  facet_wrap(~time + consider,ncol = 4) +
+  scale_color_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  )+
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+D = ggplot(plot3, aes(x = season, y = median_CE, color = stal, fill = stal)) +
+  geom_hline(yintercept = 0, linetype = "dashed",size = 1.5, color = "grey") + 
+  geom_point( size = 3, position = position_dodge(0.4)) +
+  theme_bw() +
+  facet_wrap(~time + consider,ncol = 4) +
+  scale_color_manual(
+    values = c(
+      "Aqua" = "#F08080",     # 淡蓝色，低饱和度
+      "Terra" = "#89CFF0"     # 淡红色，低饱和度
+    )
+  )+
+  theme(
+    axis.title = element_text(size = 14, face = "bold", color = "black"),
+    axis.title.y = element_text(size = 14, face = "bold", color = "black"), # 向上平移 y 轴标题
+    axis.text = element_text(size = 14, face = "plain", color = "black"),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14, angle = 90, hjust = 0.5),  # 旋转 y 轴数据
+    panel.background = element_rect(colour = "black", fill = NA),
+    panel.grid.minor = element_blank(),
+    text = element_text(size = 14),
+    legend.position = "none",
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(colour = NA, fill = NA),
+    axis.ticks = element_line(colour = "black")
+  )
+
+ggarrange(C,D,ncol = 2)
+
+
+setwd("G:\\Global_urban_vegetation_trees_cooling_effects\\Figure\\Figure2")
+smulti3 <- multi3 %>%
+  select(ORIG_FID, season, mean_slope_EVI, sens_slope) %>%
+  pivot_wider(names_from = season, values_from = c(mean_slope_EVI, sens_slope), names_sep = "_")
+
+smulti4 <- multi4 %>%
+  select(ORIG_FID, season, mean_slope_EVI, sens_slope) %>%
+  pivot_wider(names_from = season, values_from = c(mean_slope_EVI, sens_slope), names_sep = "_")
+
+
+write.csv(smulti3,"multi_day_expan_season_trend_slope.csv")
+write.csv(smulti4,"multi_night_expan_season_trend_slope.csv")
+
+
+suni3 <- uni1 %>%
+  select(ORIG_FID, season, mean_slope_EVI, sens_slope) %>%
+  pivot_wider(names_from = season, values_from = c(mean_slope_EVI, sens_slope), names_sep = "_")
+
+suni4 <- uni2 %>%
+  select(ORIG_FID, season, mean_slope_EVI, sens_slope) %>%
+  pivot_wider(names_from = season, values_from = c(mean_slope_EVI, sens_slope), names_sep = "_")
+
+write.csv(suni3,"uni_day_expan_season_trend_slope.csv")
+write.csv(suni4,"uni_night_expan_season_trend_slope.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
